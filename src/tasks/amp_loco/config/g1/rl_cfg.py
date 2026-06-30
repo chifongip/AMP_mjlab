@@ -66,7 +66,7 @@ def g1_amp_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
     ),
     experiment_name="g1_amp_locomotion",
     logger="tensorboard",
-    save_interval=100,
+    save_interval=500,
     num_steps_per_env=24,
     max_iterations=100001,
     # AMP parameters

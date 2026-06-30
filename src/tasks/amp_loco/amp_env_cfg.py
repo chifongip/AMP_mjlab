@@ -139,14 +139,12 @@ def make_amp_env_cfg() -> ManagerBasedRlEnvCfg:
       concatenate_terms=True,
       enable_corruption=True,
       history_length=4,
-      history_ordering="time",
     ),
     "critic": ObservationGroupCfg(
       terms=critic_terms,
       concatenate_terms=True,
       enable_corruption=False,
       history_length=4,
-      history_ordering="time",
     ),
     "amp": ObservationGroupCfg(
       terms=amp_terms,

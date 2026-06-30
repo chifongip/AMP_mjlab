@@ -4,7 +4,9 @@ from setuptools import setup, find_packages
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
-    "mjlab==1.2.0",
+    "mjlab==1.5.0",
+    # rsl-rl-lib (v5.4.1+) with AMP support must be installed separately:
+    #   pip install git+https://github.com/chifongip/rsl_rl.git@main
 ]
 
 # Installation operation
