@@ -21,8 +21,8 @@ def g1_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = make_amp_env_cfg()
 
   # Keep CCD high enough for stability but avoid Warp OOM from excessive EPA buffers.
-  cfg.sim.mujoco.ccd_iterations = 128
-  cfg.sim.contact_sensor_maxmatch = 128
+  cfg.sim.mujoco.ccd_iterations = 500
+  cfg.sim.contact_sensor_maxmatch = 500
   cfg.sim.nconmax = 48
 
   cfg.scene.entities = {"robot": get_g1_robot_cfg()}
@@ -159,12 +159,12 @@ def g1_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0
 
-    # if cfg.scene.terrain is not None:
-    #   if cfg.scene.terrain.terrain_generator is not None:
-    #     cfg.scene.terrain.terrain_generator.curriculum = False
-    #     cfg.scene.terrain.terrain_generator.num_cols = 5
-    #     cfg.scene.terrain.terrain_generator.num_rows = 5
-    #     cfg.scene.terrain.terrain_generator.border_width = 10.0
+    if cfg.scene.terrain is not None:
+      if cfg.scene.terrain.terrain_generator is not None:
+        cfg.scene.terrain.terrain_generator.curriculum = False
+        cfg.scene.terrain.terrain_generator.num_cols = 5
+        cfg.scene.terrain.terrain_generator.num_rows = 5
+        cfg.scene.terrain.terrain_generator.border_width = 10.0
 
   return cfg
 
