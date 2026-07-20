@@ -2,18 +2,21 @@
 
 import os
 
-from src.assets.robots import (
-  G1_ACTION_SCALE,
-  get_g1_robot_cfg,
-)
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+
+import src.tasks.amp_loco.mdp as amp_mdp
+from src.assets.robots import (
+  G1_ACTION_SCALE,
+  get_g1_robot_cfg,
+)
 from src.tasks.amp_loco.amp_env_cfg import make_amp_env_cfg
 
 def g1_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -199,5 +202,49 @@ def g1_amp_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     twist_cmd.ranges.lin_vel_x = (-1.5, 3.0)
     twist_cmd.ranges.lin_vel_y = (-1.0, 1.0)
     twist_cmd.ranges.ang_vel_z = (-3.14 / 2, 3.14 / 2)
+
+  return cfg
+
+
+def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
+  """Create Unitree G1 flat terrain fall-recovery configuration."""
+  cfg = g1_amp_flat_env_cfg(play=play)
+
+  # Every environment resets from recovery data and receives time to get up.
+  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0
+  cfg.events["init_motion_loader"].params["max_delay_steps"] = 250
+
+  # Recovery ends in quiet standing rather than commanded locomotion.
+  twist_cmd = cfg.commands["twist"]
+  assert isinstance(twist_cmd, UniformVelocityCommandCfg)
+  twist_cmd.rel_standing_envs = 1.0
+  twist_cmd.rel_heading_envs = 0.0
+  twist_cmd.heading_command = False
+  twist_cmd.ranges.lin_vel_x = (0.0, 0.0)
+  twist_cmd.ranges.lin_vel_y = (0.0, 0.0)
+  twist_cmd.ranges.ang_vel_z = (0.0, 0.0)
+  twist_cmd.ranges.heading = None
+
+  # Velocity and terrain curricula are not part of recovery-only training.
+  cfg.curriculum = {}
+
+  if not play:
+    cfg.events["upward_recovery_assistance"] = EventTermCfg(
+      func=amp_mdp.UpwardRecoveryAssistance,
+      mode="step",
+      params={
+        "force_range": (0.0, 200.0),
+        # 500 policy iterations at 24 environment steps per iteration.
+        "anneal_steps": 500 * 24,
+        "asset_cfg": SceneEntityCfg(
+          "robot", body_names=("torso_link",)
+        ),
+        # Draw an orange +Z arrow in viewers/videos when assistance is active.
+        "debug_vis": True,
+        # 200 N maps to a 0.4 m arrow, keeping the overlay readable.
+        "viz_scale": 0.002,
+        "viz_width": 0.02,
+      },
+    )
 
   return cfg

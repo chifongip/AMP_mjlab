@@ -139,6 +139,8 @@ def run_play(task_id: str, cfg: PlayConfig):
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
   env_cfg = load_env_cfg(task_id, play=True)
+  for name in ("push_robot", "foot_friction", "encoder_bias", "base_com", "randomize_terrain"):
+    env_cfg.events.pop(name, None)
   agent_cfg = load_rl_cfg(task_id)
 
   DUMMY_MODE = cfg.agent in {"zero", "random"}

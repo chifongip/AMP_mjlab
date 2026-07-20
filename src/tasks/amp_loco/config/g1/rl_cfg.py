@@ -93,3 +93,13 @@ def g1_amp_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
     ),
     amp_anchor_name="torso_link",
   )
+
+
+def g1_amp_recovery_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
+  """Create RL runner configuration using only recovery demonstrations."""
+  cfg = g1_amp_ppo_runner_cfg()
+  cfg.experiment_name = "g1_amp_recovery"
+  cfg.amp_motion_files = os.path.normpath(
+    os.path.join(_MOTION_DATA_DIR, "Recovery")
+  )
+  return cfg

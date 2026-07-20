@@ -139,6 +139,7 @@ class AMPOnPolicyRunner(_MigratedAMPOnPolicyRunner):
     Extends the migrated v6 ``AMPOnPolicyRunner`` from rsl_rl, adding:
     - Config adaptation from mjlab format to v6 format.
     - Automatic ONNX export on every save.
+    - Environment step-counter persistence for resume-safe curricula.
     """
 
     env: RslRlVecEnvWrapper
@@ -197,6 +198,12 @@ class AMPOnPolicyRunner(_MigratedAMPOnPolicyRunner):
     # ------------------------------------------------------------------
 
     def save(self, path: str, infos=None):
+        infos = {
+            **(infos or {}),
+            "env_state": {
+                "common_step_counter": self.env.unwrapped.common_step_counter,
+            },
+        }
         super().save(path, infos)
         policy_path = path.split("model")[0]
         filename = "policy.onnx"
@@ -216,3 +223,21 @@ class AMPOnPolicyRunner(_MigratedAMPOnPolicyRunner):
             wandb.save(
                 policy_path + filename, base_path=os.path.dirname(policy_path)
             )
+
+    def load(
+        self,
+        path: str,
+        load_optimizer: bool = True,
+        map_location: str | None = None,
+    ):
+        infos = super().load(
+            path,
+            load_optimizer=load_optimizer,
+            map_location=map_location,
+        )
+        env_state = (infos or {}).get("env_state", {})
+        if "common_step_counter" in env_state:
+            self.env.unwrapped.common_step_counter = env_state[
+                "common_step_counter"
+            ]
+        return infos

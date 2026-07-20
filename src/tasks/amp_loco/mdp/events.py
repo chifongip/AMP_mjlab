@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
 if TYPE_CHECKING:
-    from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 from src.tasks.amp_loco.ampmotion_loader import MotionLoader
 from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
@@ -184,6 +186,152 @@ class MotionResetManager:
             "joint_pos": torch.cat(joint_pos_list, dim=0),
             "joint_vel": torch.cat(joint_vel_list, dim=0),
         }
+
+
+class UpwardRecoveryAssistance:
+    """Apply an annealed upward force while delayed environments recover."""
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv) -> None:
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self._asset: Entity = env.scene[asset_cfg.name]
+        self._body_ids = asset_cfg.body_ids
+        if not isinstance(self._body_ids, list) or not self._body_ids:
+            raise ValueError(
+                "UpwardRecoveryAssistance requires one or more explicit body names."
+            )
+
+        self._num_envs = env.num_envs
+        self._num_bodies = len(self._body_ids)
+        self._device = env.device
+
+        self._force_range = tuple(cfg.params["force_range"])
+        force_min, force_max = self._force_range
+        if force_min < 0.0 or force_max < force_min:
+            raise ValueError(
+                f"Invalid upward assistance force range: {self._force_range}"
+            )
+
+        self._anneal_steps = int(cfg.params["anneal_steps"])
+        if self._anneal_steps <= 0:
+            raise ValueError("anneal_steps must be positive.")
+
+        self._debug_vis_enabled = bool(cfg.params.get("debug_vis", True))
+        self._viz_scale = float(cfg.params.get("viz_scale", 0.002))
+        self._viz_width = float(cfg.params.get("viz_width", 0.02))
+        if self._viz_scale <= 0.0:
+            raise ValueError("viz_scale must be positive.")
+        if self._viz_width <= 0.0:
+            raise ValueError("viz_width must be positive.")
+
+        self._sampled_magnitude = torch.zeros(
+            self._num_envs, device=self._device
+        )
+        self._applied_magnitude = torch.zeros_like(self._sampled_magnitude)
+        self._forces = torch.zeros(
+            (self._num_envs, self._num_bodies, 3), device=self._device
+        )
+        self._torques = torch.zeros_like(self._forces)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | None,
+        force_range: tuple[float, float],
+        anneal_steps: int,
+        asset_cfg: SceneEntityCfg,
+        debug_vis: bool = True,
+        viz_scale: float = 0.002,
+        viz_width: float = 0.02,
+    ) -> None:
+        del env_ids, force_range, anneal_steps, asset_cfg, debug_vis, viz_scale, viz_width
+
+        tm = env.termination_manager
+        if isinstance(tm, DelayedTerminationManager):
+            active = tm._delay_env_mask & (tm._delay_counters > 0)
+        else:
+            active = torch.zeros(
+                self._num_envs, dtype=torch.bool, device=self._device
+            )
+
+        progress = min(env.common_step_counter / self._anneal_steps, 1.0)
+        scale = max(1.0 - progress, 0.0)
+        self._applied_magnitude.copy_(
+            self._sampled_magnitude * scale * active.float()
+        )
+
+        # The selected body receives a world-frame +Z force at its center of mass.
+        # Rewrite all components every step so recovery completion clears the wrench.
+        self._forces.zero_()
+        self._torques.zero_()
+        self._forces[:, :, 2] = self._applied_magnitude[:, None]
+        self._asset.write_external_wrench_to_sim(
+            self._forces,
+            self._torques,
+            body_ids=self._body_ids,
+        )
+
+        log = env.extras.setdefault("log", {})
+        log["Curriculum/upward_assistance_scale"] = torch.tensor(
+            scale, device=self._device
+        )
+        log["Metrics/upward_assistance_active_fraction"] = active.float().mean()
+        log["Metrics/upward_assistance_force_mean"] = (
+            self._applied_magnitude.mean()
+        )
+
+    def debug_vis(self, visualizer: DebugVisualizer) -> None:
+        """Draw upward-force arrows at the selected body center of mass."""
+        if not self._debug_vis_enabled:
+            return
+
+        env_indices = list(visualizer.get_env_indices(self._num_envs))
+        if not env_indices:
+            return
+
+        env_ids = torch.as_tensor(env_indices, device=self._device, dtype=torch.long)
+        body_positions = self._asset.data.body_com_pos_w[env_ids][:, self._body_ids]
+        magnitudes = self._applied_magnitude[env_ids]
+        body_positions_np = body_positions.detach().cpu().numpy()
+        magnitudes_np = magnitudes.detach().cpu().numpy()
+
+        for env_row, _env_idx in enumerate(env_indices):
+            magnitude = float(magnitudes_np[env_row])
+            if magnitude <= 1.0e-6:
+                continue
+
+            for body_row in range(self._num_bodies):
+                start = body_positions_np[env_row, body_row]
+                end = start + np.array(
+                    [0.0, 0.0, magnitude * self._viz_scale], dtype=np.float32
+                )
+                visualizer.add_arrow(
+                    start=start,
+                    end=end,
+                    color=(1.0, 0.2, 0.05, 0.9),
+                    width=self._viz_width,
+                )
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+
+        num_reset = self._num_envs if isinstance(env_ids, slice) else len(env_ids)
+        force_min, force_max = self._force_range
+        sampled = torch.empty(num_reset, device=self._device).uniform_(
+            force_min, force_max
+        )
+        self._sampled_magnitude[env_ids] = sampled
+        self._applied_magnitude[env_ids] = 0.0
+
+        zeros = torch.zeros(
+            (num_reset, self._num_bodies, 3), device=self._device
+        )
+        self._asset.write_external_wrench_to_sim(
+            zeros,
+            zeros,
+            env_ids=env_ids,
+            body_ids=self._body_ids,
+        )
 
 
 # ------------------------------------------------------------------
