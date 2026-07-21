@@ -17,6 +17,7 @@ from src.assets.robots import (
   G1_ACTION_SCALE,
   get_g1_robot_cfg,
 )
+from src.assets.robots.unitree_g1.g1_constants import HOME_KEYFRAME
 from src.tasks.amp_loco.amp_env_cfg import make_amp_env_cfg
 
 def g1_amp_rough_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -210,9 +211,10 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Create Unitree G1 flat terrain fall-recovery configuration."""
   cfg = g1_amp_flat_env_cfg(play=play)
 
-  # Every environment resets from recovery data and receives time to get up.
-  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0
+  # Mix recovery resets with quiet standing resets using a fixed startup mask.
+  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0 if play else 0.4
   cfg.events["init_motion_loader"].params["max_delay_steps"] = 250
+  cfg.events["reset_from_motion"].params["home_keyframe"] = HOME_KEYFRAME
 
   # Recovery ends in quiet standing rather than commanded locomotion.
   twist_cmd = cfg.commands["twist"]
@@ -234,8 +236,8 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       mode="step",
       params={
         "force_range": (0.0, 200.0),
-        # 500 policy iterations at 24 environment steps per iteration.
-        "anneal_steps": 500 * 24,
+        # 2000 policy iterations at 24 environment steps per iteration.
+        "anneal_steps": 2000 * 24,
         "asset_cfg": SceneEntityCfg(
           "robot", body_names=("torso_link",)
         ),

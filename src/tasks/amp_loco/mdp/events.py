@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from mjlab.entity import Entity
+from mjlab.entity import Entity, EntityCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.string import resolve_expr
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -74,6 +75,7 @@ class MotionResetManager:
         env_ids: torch.Tensor | None,
         motion_dir: str,
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+        home_keyframe: EntityCfg.InitialStateCfg | None = None,
     ) -> None:
         if env_ids is None:
             env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
@@ -91,9 +93,16 @@ class MotionResetManager:
             delay_ids = env_ids[:0]  # empty
             normal_ids = env_ids
 
-        # Reset normal envs with walk/run data.
+        # Reset normal envs with a configured home pose or walk/run data.
         if len(normal_ids) > 0:
-            self._write_reset_state(env, normal_ids, self.walk_run_frames[motion_dir], asset_cfg)
+            if home_keyframe is not None:
+                self._write_keyframe_state(
+                    env, normal_ids, home_keyframe, asset_cfg
+                )
+            else:
+                self._write_reset_state(
+                    env, normal_ids, self.walk_run_frames[motion_dir], asset_cfg
+                )
 
         # Reset delay envs with recovery data (fallback to walk/run if unavailable).
         if len(delay_ids) > 0:
@@ -154,6 +163,69 @@ class MotionResetManager:
 
         asset.write_joint_state_to_sim(
             joint_pos_clamped,
+            joint_vel[:, asset_cfg.joint_ids],
+            env_ids=env_ids,
+            joint_ids=joint_ids,
+        )
+
+    def _write_keyframe_state(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor,
+        keyframe: EntityCfg.InitialStateCfg,
+        asset_cfg: SceneEntityCfg,
+    ) -> None:
+        asset: Entity = env.scene[asset_cfg.name]
+        num_reset = len(env_ids)
+
+        root_pos = torch.tensor(
+            keyframe.pos, dtype=torch.float, device=env.device
+        ).repeat(num_reset, 1)
+        root_pos += env.scene.env_origins[env_ids]
+        root_quat = torch.tensor(
+            keyframe.rot, dtype=torch.float, device=env.device
+        ).repeat(num_reset, 1)
+        root_pose = torch.cat([root_pos, root_quat], dim=-1)
+        asset.write_root_link_pose_to_sim(root_pose, env_ids=env_ids)
+
+        root_lin_vel = torch.tensor(
+            keyframe.lin_vel, dtype=torch.float, device=env.device
+        ).repeat(num_reset, 1)
+        root_ang_vel = torch.tensor(
+            keyframe.ang_vel, dtype=torch.float, device=env.device
+        ).repeat(num_reset, 1)
+        root_vel = torch.cat([root_lin_vel, root_ang_vel], dim=-1)
+        asset.write_root_link_velocity_to_sim(root_vel, env_ids=env_ids)
+
+        if keyframe.joint_pos is None:
+            raise ValueError(
+                "MotionResetManager home_keyframe requires explicit joint_pos."
+            )
+
+        joint_pos = torch.tensor(
+            resolve_expr(keyframe.joint_pos, asset.joint_names, 0.0),
+            dtype=torch.float,
+            device=env.device,
+        ).repeat(num_reset, 1)
+        joint_vel = torch.tensor(
+            resolve_expr(keyframe.joint_vel, asset.joint_names, 0.0),
+            dtype=torch.float,
+            device=env.device,
+        ).repeat(num_reset, 1)
+
+        soft_joint_pos_limits = asset.data.soft_joint_pos_limits
+        assert soft_joint_pos_limits is not None
+        joint_pos_limits = soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
+        joint_pos_selected = joint_pos[:, asset_cfg.joint_ids].clamp_(
+            joint_pos_limits[..., 0], joint_pos_limits[..., 1]
+        )
+
+        joint_ids = asset_cfg.joint_ids
+        if isinstance(joint_ids, list):
+            joint_ids = torch.tensor(joint_ids, device=env.device)
+
+        asset.write_joint_state_to_sim(
+            joint_pos_selected,
             joint_vel[:, asset_cfg.joint_ids],
             env_ids=env_ids,
             joint_ids=joint_ids,
@@ -375,11 +447,13 @@ def reset_from_motion_data(
     env_ids: torch.Tensor | None,
     motion_dir: str,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    home_keyframe: EntityCfg.InitialStateCfg | None = None,
 ) -> None:
-    """Reset event: reset envs from random motion frames, with delay support."""
+    """Reset event: reset envs from motion frames or a home keyframe."""
     MotionResetManager.get().reset(
         env=env,
         env_ids=env_ids,
         motion_dir=motion_dir,
         asset_cfg=asset_cfg,
+        home_keyframe=home_keyframe,
     )
