@@ -154,18 +154,92 @@ def body_ang_vel_xy_l2(
 def track_root_height(
   env: ManagerBasedRlEnv,
   std: float,
+  target_height: float | None = None,
+  reward_outside_delay: bool = False,
   mask_delay: bool = False,
   delay_env_rew_ratio: float = 1.0,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """Reward for tracking the commanded anchor height."""
+  """Reward root-height tracking, optionally outside delayed termination."""
   asset: Entity = env.scene[asset_cfg.name]
 
-  desired_height = asset.data.default_root_state[:, 2]
-  cur_root_height = asset.data.body_link_pos_w[:, 0, 2]
+  if target_height is None:
+    desired_height = asset.data.default_root_state[:, 2]
+    cur_root_height = asset.data.body_link_pos_w[:, 0, 2]
+  else:
+    desired_height = torch.full(
+      (env.num_envs,), target_height, device=env.device
+    )
+    cur_root_height = (
+      asset.data.body_link_pos_w[:, 0, 2] - env.scene.env_origins[:, 2]
+    )
   height_error = torch.square(desired_height - cur_root_height)
   reward = torch.exp(-height_error / std**2)
+  if reward_outside_delay:
+    return _apply_delay_env_reward_scaling(
+      env, reward, mask_delay, delay_env_rew_ratio
+    )
   return _apply_delay_env_reward_mask_only(env, reward, mask_delay, delay_env_rew_ratio)
+
+
+def body_orientation_l2(
+  env: ManagerBasedRlEnv,
+  mask_delay: bool = False,
+  delay_env_rew_ratio: float = 1.0,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  body_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+) -> torch.Tensor:
+  """Penalize torso roll and pitch outside active delayed termination."""
+  asset: Entity = env.scene[asset_cfg.name]
+  body_quat_w = asset.data.body_link_quat_w[:, body_cfg.body_ids[0]]
+  projected_gravity_b = quat_apply_inverse(body_quat_w, asset.data.gravity_vec_w)
+  orientation_cost = torch.sum(
+    torch.square(projected_gravity_b[:, :2]), dim=1
+  )
+  return _apply_delay_env_reward_scaling(
+    env, orientation_cost, mask_delay, delay_env_rew_ratio
+  )
+
+
+class StandStill:
+  """Penalize deviation from a target pose with optional delay scaling."""
+
+  def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRlEnv):
+    asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+    asset: Entity = env.scene[asset_cfg.name]
+    _, joint_names = asset.find_joints(asset_cfg.joint_names)
+
+    target_joint_pos = torch.zeros(
+      len(joint_names), device=env.device, dtype=torch.float32
+    )
+    indices, _, values = resolve_matching_names_values(
+      data=cfg.params["target_joint_pos"],
+      list_of_strings=joint_names,
+    )
+    target_joint_pos[indices] = torch.tensor(
+      values, device=env.device, dtype=torch.float32
+    )
+    self.target_joint_pos = target_joint_pos
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    target_joint_pos: dict[str, float],
+    mask_delay: bool = False,
+    delay_env_rew_ratio: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  ) -> torch.Tensor:
+    del target_joint_pos  # Resolved once during initialization.
+
+    asset: Entity = env.scene[asset_cfg.name]
+    current_joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    posture_cost = torch.sum(
+      torch.square(current_joint_pos - self.target_joint_pos), dim=1
+    )
+    return _apply_delay_env_reward_scaling(
+      env, posture_cost, mask_delay, delay_env_rew_ratio
+    )
+
 
 def feet_slip(
   env: ManagerBasedRlEnv,
@@ -244,5 +318,3 @@ def self_collision_cost(
     return hit.sum(dim=-1).float()  # [B]
   assert data.found is not None
   return data.found.squeeze(-1)
-
-

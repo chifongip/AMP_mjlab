@@ -4,8 +4,48 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from mjlab.entity import Entity
+from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.utils.lab_api.math import quat_apply_inverse
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
+
+
+_DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
+
+def root_height(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Return root height relative to each environment origin."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return asset.data.body_link_pos_w[:, 0, 2] - env.scene.env_origins[:, 2]
+
+
+def body_tilt(
+  env: ManagerBasedRlEnv,
+  body_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+) -> torch.Tensor:
+  """Return body tilt from upright in radians."""
+  asset: Entity = env.scene[body_cfg.name]
+  body_quat_w = asset.data.body_link_quat_w[:, body_cfg.body_ids[0]]
+  projected_gravity_b = quat_apply_inverse(body_quat_w, asset.data.gravity_vec_w)
+  return torch.acos(torch.clamp(-projected_gravity_b[:, 2], min=-1.0, max=1.0))
+
+
+def standing_success(
+  env: ManagerBasedRlEnv,
+  minimum_height: float,
+  maximum_tilt: float,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+  body_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=()),
+) -> torch.Tensor:
+  """Return one for environments satisfying standing height and tilt targets."""
+  height = root_height(env, asset_cfg)
+  tilt = body_tilt(env, body_cfg)
+  return ((height >= minimum_height) & (tilt <= maximum_tilt)).float()
 
 
 def mean_delay_steps(env: ManagerBasedRlEnv) -> torch.Tensor:

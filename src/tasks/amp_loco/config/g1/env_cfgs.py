@@ -1,11 +1,13 @@
 """Unitree G1 AMP Locomotion environment configurations."""
 
+import math
 import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.metrics_manager import MetricsTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
@@ -212,7 +214,7 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = g1_amp_flat_env_cfg(play=play)
 
   # Mix recovery resets with quiet standing resets using a fixed startup mask.
-  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0 if play else 0.4
+  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0 if play else 0.9
   cfg.events["init_motion_loader"].params["max_delay_steps"] = 250
   cfg.events["reset_from_motion"].params["home_keyframe"] = HOME_KEYFRAME
 
@@ -229,6 +231,54 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # Velocity and terrain curricula are not part of recovery-only training.
   cfg.curriculum = {}
+
+  cfg.rewards["track_root_height"].params.update(
+    {
+      "target_height": HOME_KEYFRAME.pos[2],
+      "reward_outside_delay": True,
+    }
+  )
+
+  # Once upright, settle into the HOME pose represented in the AMP references.
+  cfg.rewards["stand_still"] = RewardTermCfg(
+    func=amp_mdp.StandStill,
+    weight=-1.0,
+    params={
+      "target_joint_pos": HOME_KEYFRAME.joint_pos,
+      "mask_delay": True,
+      "delay_env_rew_ratio": 0.0,
+      "asset_cfg": SceneEntityCfg("robot", joint_names=(".*",)),
+    },
+  )
+  cfg.rewards["body_orientation_l2"] = RewardTermCfg(
+    func=amp_mdp.body_orientation_l2,
+    weight=-1.0,
+    params={
+      "mask_delay": True,
+      "delay_env_rew_ratio": 0.0,
+      "asset_cfg": SceneEntityCfg("robot"),
+      "body_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+    },
+  )
+  cfg.metrics["root_height"] = MetricsTermCfg(
+    func=amp_mdp.root_height,
+    params={"asset_cfg": SceneEntityCfg("robot")},
+  )
+  cfg.metrics["torso_tilt"] = MetricsTermCfg(
+    func=amp_mdp.body_tilt,
+    params={
+      "body_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+    },
+  )
+  cfg.metrics["standing_success"] = MetricsTermCfg(
+    func=amp_mdp.standing_success,
+    params={
+      "minimum_height": 0.7,
+      "maximum_tilt": math.radians(20.0),
+      "asset_cfg": SceneEntityCfg("robot"),
+      "body_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+    },
+  )
 
   if not play:
     cfg.events["upward_recovery_assistance"] = EventTermCfg(
