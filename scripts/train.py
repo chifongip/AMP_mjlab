@@ -1,12 +1,16 @@
 """Script to train RL agent with RSL-RL."""
 
+import json
 import logging
 import os
+import platform
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from importlib import metadata
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal
 
 import tyro
 
@@ -19,6 +23,11 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
+from src.tasks.amp_loco.recovery_curriculum import (
+  configure_recovery_curriculum_interval,
+  validate_recovery_curriculum_workers,
+)
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -29,6 +38,8 @@ class TrainConfig:
   video_length: int = 200
   video_interval: int = 2000
   enable_nan_guard: bool = False
+  deterministic: bool = False
+  """Favor practically reproducible GPU execution over maximum throughput."""
   torchrunx_log_dir: str | None = None
   gpu_ids: list[int] | Literal["all"] | None = field(default_factory=lambda: [0])
 
@@ -37,6 +48,95 @@ class TrainConfig:
     env_cfg = load_env_cfg(task_id)
     agent_cfg = load_rl_cfg(task_id)
     return TrainConfig(env=env_cfg, agent=agent_cfg)
+
+
+def _package_version(distribution: str) -> str | None:
+  try:
+    return metadata.version(distribution)
+  except metadata.PackageNotFoundError:
+    return None
+
+
+def _git_value(*args: str) -> str | None:
+  try:
+    result = subprocess.run(
+      ("git", *args),
+      check=True,
+      capture_output=True,
+      text=True,
+    )
+  except (OSError, subprocess.CalledProcessError):
+    return None
+  return result.stdout.strip()
+
+
+def _write_provenance(
+  log_dir: Path,
+  task_id: str,
+  cfg: TrainConfig,
+  device: str,
+) -> None:
+  import torch
+
+  nvidia_driver = None
+  driver_path = Path("/proc/driver/nvidia/version")
+  if driver_path.exists():
+    nvidia_driver = driver_path.read_text(encoding="utf-8").splitlines()[0]
+
+  gpu = None
+  if device.startswith("cuda") and torch.cuda.is_available():
+    gpu_index = torch.device(device).index or 0
+    properties = torch.cuda.get_device_properties(gpu_index)
+    gpu = {
+      "name": properties.name,
+      "compute_capability": f"{properties.major}.{properties.minor}",
+      "total_memory_bytes": properties.total_memory,
+    }
+
+  status = _git_value("status", "--short")
+  provenance = {
+    "task_id": task_id,
+    "command": sys.argv,
+    "working_directory": str(Path.cwd()),
+    "seed": cfg.agent.seed,
+    "device": device,
+    "deterministic_requested": cfg.deterministic,
+    "deterministic_algorithms_enabled": torch.are_deterministic_algorithms_enabled(),
+    "cudnn_deterministic": torch.backends.cudnn.deterministic,
+    "cudnn_benchmark": torch.backends.cudnn.benchmark,
+    "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+    "python": platform.python_version(),
+    "platform": platform.platform(),
+    "git": {
+      "commit": _git_value("rev-parse", "HEAD"),
+      "dirty": bool(status),
+      "status": status,
+    },
+    "gpu": gpu,
+    "nvidia_driver": nvidia_driver,
+    "torch": {
+      "version": torch.__version__,
+      "cuda": torch.version.cuda,
+      "cudnn": torch.backends.cudnn.version(),
+    },
+    "packages": {
+      name: _package_version(name)
+      for name in (
+        "mjlab",
+        "mujoco",
+        "mujoco-warp",
+        "warp-lang",
+        "rsl-rl-lib",
+        "wbc_mjlab",
+      )
+    },
+  }
+  params_dir = log_dir / "params"
+  params_dir.mkdir(parents=True, exist_ok=True)
+  (params_dir / "provenance.json").write_text(
+    json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+  )
 
 
 def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
@@ -54,10 +154,29 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     # Set seed to have diversity in different processes.
     seed = cfg.agent.seed + local_rank
 
-  configure_torch_backends()
+  configure_torch_backends(
+    allow_tf32=not cfg.deterministic,
+    deterministic=cfg.deterministic,
+  )
+  if cfg.deterministic:
+    import torch
+
+    # warn_only keeps the practical GPU mode usable when MuJoCo Warp reaches
+    # an operation for which PyTorch has no deterministic implementation.
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
   cfg.agent.seed = seed
   cfg.env.seed = seed
+  configure_recovery_curriculum_interval(
+    cfg.env.events,
+    cfg.agent.num_steps_per_env,
+  )
+  if cfg.deterministic:
+    for sensor_cfg in cfg.env.scene.sensors:
+      if getattr(sensor_cfg, "reduce", None) == "none":
+        # Unsorted contact slots are explicitly non-deterministic. Choosing
+        # the strongest contact gives stable semantics for single-slot sensors.
+        sensor_cfg.reduce = "maxforce"
 
   print(f"[INFO] Training with: device={device}, seed={seed}, rank={rank}")
 
@@ -88,6 +207,11 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   if rank == 0:
     print(f"[INFO] Logging experiment in directory: {log_dir}")
+    if cfg.deterministic:
+      print(
+        "[INFO] Practical determinism enabled; MuJoCo Warp does not guarantee "
+        "bitwise-identical simulation."
+      )
 
   env = ManagerBasedRlEnv(
     cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None
@@ -134,6 +258,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   if rank == 0:
     dump_yaml(log_dir / "params" / "env.yaml", env_cfg)
     dump_yaml(log_dir / "params" / "agent.yaml", agent_cfg)
+    _write_provenance(log_dir, task_id, cfg, device)
 
   runner.learn(
     num_learning_iterations=cfg.agent.max_iterations, init_at_random_ep_len=True
@@ -145,6 +270,10 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 def launch_training(task_id: str, args: TrainConfig | None = None):
   args = args or TrainConfig.from_task(task_id)
 
+  if args.deterministic:
+    # This must be set before the first CUDA/cuBLAS operation in each worker.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
   # Create log directory once before launching workers.
   log_root_path = Path("logs") / "rsl_rl" / args.agent.experiment_name
   log_root_path.resolve()
@@ -155,6 +284,7 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
 
   # Select GPUs based on CUDA_VISIBLE_DEVICES and user specification.
   selected_gpus, num_gpus = select_gpus(args.gpu_ids)
+  validate_recovery_curriculum_workers(args.env.events, num_gpus)
 
   # Set environment variables for all modes.
   if selected_gpus is None:
@@ -188,7 +318,8 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
       hostnames=["localhost"],
       workers_per_host=num_gpus,
       backend=None,  # Let rsl_rl handle process group initialization.
-      copy_env_vars=torchrunx.DEFAULT_ENV_VARS_FOR_COPY + ("MUJOCO*",),
+      copy_env_vars=torchrunx.DEFAULT_ENV_VARS_FOR_COPY
+      + ("MUJOCO*", "CUBLAS_WORKSPACE_CONFIG"),
     ).run(run_train, task_id, args, log_dir)
 
 

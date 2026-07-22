@@ -30,27 +30,36 @@ class DelayedTerminationManager(TerminationManager):
         self._delay_env_mask = delay_env_mask          # (num_envs,) bool
         self._delay_counters = torch.zeros_like(delay_env_mask, dtype=torch.long)
         self._max_delay_steps = max_delay_steps
+        self._delay_failure_buf = torch.zeros_like(delay_env_mask)
+        self._delay_timeout_buf = torch.zeros_like(delay_env_mask)
 
     def compute(self) -> torch.Tensor:
-        dones = super().compute()  # fills _truncated_buf, _terminated_buf
+        super().compute()  # fills _truncated_buf, _terminated_buf
+        self._delay_failure_buf.zero_()
+        self._delay_timeout_buf.copy_(self._delay_env_mask & self._truncated_buf)
 
         if self._max_delay_steps <= 0:
-            return dones
+            return self._truncated_buf | self._terminated_buf
 
-        # For delay envs that just got a done signal, increment counter.
-        delay_and_done = self._delay_env_mask & dones
-        self._delay_counters[delay_and_done] += 1
+        # Only delay task failures. Timeouts remain immediate episode boundaries.
+        delay_and_terminated = self._delay_env_mask & self._terminated_buf
+        self._delay_counters[delay_and_terminated] += 1
 
         # Delay envs whose counter hasn't reached threshold: suppress reset.
-        not_ready = delay_and_done & (self._delay_counters < self._max_delay_steps)
-        # self._truncated_buf[not_ready] = False
+        not_ready = delay_and_terminated & (
+            self._delay_counters < self._max_delay_steps
+        )
         self._terminated_buf[not_ready] = False
 
-        # Delay envs whose counter reached threshold: allow reset, clear counter.
-        ready = delay_and_done & (self._delay_counters >= self._max_delay_steps)
+        # Expose a one-step pulse before clearing failed attempts for reset.
+        ready = delay_and_terminated & (
+            self._delay_counters >= self._max_delay_steps
+        )
+        self._delay_failure_buf.copy_(ready & ~self._delay_timeout_buf)
         self._delay_counters[ready] = 0
 
-        # Clear counters for delay envs that are NOT done (env recovered on its own).
-        self._delay_counters[self._delay_env_mask & ~dones] = 0
+        # Clear counters after recovery or an episode timeout.
+        recovered = self._delay_env_mask & ~delay_and_terminated
+        self._delay_counters[recovered | self._delay_timeout_buf] = 0
 
         return self._truncated_buf | self._terminated_buf

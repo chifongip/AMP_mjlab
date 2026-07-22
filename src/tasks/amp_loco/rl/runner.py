@@ -197,11 +197,27 @@ class AMPOnPolicyRunner(_MigratedAMPOnPolicyRunner):
     # Save (with ONNX export)
     # ------------------------------------------------------------------
 
+    def _recovery_assistance(self):
+        event_manager = self.env.unwrapped.event_manager
+        try:
+            term_cfg = event_manager.get_term_cfg("upward_recovery_assistance")
+        except ValueError:
+            return None
+        term = term_cfg.func
+        if hasattr(term, "state_dict") and hasattr(term, "load_state_dict"):
+            return term
+        return None
+
     def save(self, path: str, infos=None):
+        assistance = self._recovery_assistance()
+        assistance_state = assistance.state_dict() if assistance is not None else None
+        existing_env_state = (infos or {}).get("env_state", {})
         infos = {
             **(infos or {}),
             "env_state": {
+                **existing_env_state,
                 "common_step_counter": self.env.unwrapped.common_step_counter,
+                "recovery_assistance": assistance_state,
             },
         }
         super().save(path, infos)
@@ -240,4 +256,8 @@ class AMPOnPolicyRunner(_MigratedAMPOnPolicyRunner):
             self.env.unwrapped.common_step_counter = env_state[
                 "common_step_counter"
             ]
+        assistance_state = env_state.get("recovery_assistance")
+        assistance = self._recovery_assistance()
+        if assistance_state is not None and assistance is not None:
+            assistance.load_state_dict(assistance_state)
         return infos
