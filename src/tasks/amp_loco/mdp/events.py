@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,9 +15,66 @@ if TYPE_CHECKING:
   from mjlab.viewer.debug_visualizer import DebugVisualizer
 
 from src.tasks.amp_loco.ampmotion_loader import MotionLoader
+from src.tasks.amp_loco.mdp.metrics import standing_mask_from_state
 from src.tasks.amp_loco.mdp.terminations import DelayedTerminationManager
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
+
+@dataclass
+class AssistanceCurriculum:
+    """State machine for competence-gated recovery assistance."""
+
+    scales: tuple[float, ...]
+    advance_threshold: float
+    advance_hold_evaluations: int
+    rollback_threshold: float
+    rollback_hold_evaluations: int
+    stage: int = 0
+    advance_count: int = 0
+    rollback_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.scales or self.scales[-1] != 0.0:
+            raise ValueError("assistance scales must be non-empty and end at zero.")
+        if any(a <= b for a, b in zip(self.scales, self.scales[1:])):
+            raise ValueError("assistance scales must be strictly decreasing.")
+        if not 0.0 <= self.rollback_threshold < self.advance_threshold <= 1.0:
+            raise ValueError(
+                "thresholds must satisfy 0 <= rollback < advance <= 1."
+            )
+        if self.advance_hold_evaluations <= 0 or self.rollback_hold_evaluations <= 0:
+            raise ValueError("curriculum hold durations must be positive.")
+        if not 0 <= self.stage < len(self.scales):
+            raise ValueError("initial curriculum stage is out of range.")
+
+    @property
+    def scale(self) -> float:
+        return self.scales[self.stage]
+
+    def update(self, success: float) -> bool:
+        """Update performance evidence and return whether the stage changed."""
+        self.advance_count = (
+            self.advance_count + 1 if success >= self.advance_threshold else 0
+        )
+        self.rollback_count = (
+            self.rollback_count + 1 if success < self.rollback_threshold else 0
+        )
+
+        if self.stage > 0 and self.rollback_count >= self.rollback_hold_evaluations:
+            self.stage -= 1
+            self.advance_count = 0
+            self.rollback_count = 0
+            return True
+        elif (
+            self.stage < len(self.scales) - 1
+            and self.advance_count >= self.advance_hold_evaluations
+        ):
+            self.stage += 1
+            self.advance_count = 0
+            self.rollback_count = 0
+            return True
+        return False
 
 
 class MotionResetManager:
@@ -261,9 +319,10 @@ class MotionResetManager:
 
 
 class UpwardRecoveryAssistance:
-    """Apply an annealed upward force while delayed environments recover."""
+    """Apply competence-gated upward force while delayed environments recover."""
 
     def __init__(self, cfg, env: ManagerBasedRlEnv) -> None:
+        self._env = env
         asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
         self._asset: Entity = env.scene[asset_cfg.name]
         self._body_ids = asset_cfg.body_ids
@@ -283,9 +342,42 @@ class UpwardRecoveryAssistance:
                 f"Invalid upward assistance force range: {self._force_range}"
             )
 
-        self._anneal_steps = int(cfg.params["anneal_steps"])
-        if self._anneal_steps <= 0:
-            raise ValueError("anneal_steps must be positive.")
+        self._evaluation_interval_steps = int(
+            cfg.params["evaluation_interval_steps"]
+        )
+        if self._evaluation_interval_steps <= 0:
+            raise ValueError("evaluation_interval_steps must be positive.")
+        self._success_ema_alpha = float(cfg.params["success_ema_alpha"])
+        if not 0.0 < self._success_ema_alpha <= 1.0:
+            raise ValueError("success_ema_alpha must be in (0, 1].")
+        self._success_ema: float | None = None
+        self._last_evaluation_step = 0
+        self._last_attempt_success_rate: float | None = None
+        self._last_attempt_failure_rate: float | None = None
+        self._last_attempt_timeout_rate: float | None = None
+        self._curriculum = AssistanceCurriculum(
+            scales=tuple(float(value) for value in cfg.params["assistance_scales"]),
+            advance_threshold=float(cfg.params["advance_threshold"]),
+            advance_hold_evaluations=int(
+                cfg.params["advance_hold_evaluations"]
+            ),
+            rollback_threshold=float(cfg.params["rollback_threshold"]),
+            rollback_hold_evaluations=int(
+                cfg.params["rollback_hold_evaluations"]
+            ),
+            stage=int(cfg.params.get("initial_stage", 0)),
+        )
+
+        self._minimum_height = float(cfg.params["minimum_height"])
+        self._maximum_tilt = float(cfg.params["maximum_tilt"])
+        self._stable_steps_required = int(cfg.params["stable_steps"])
+        if self._stable_steps_required <= 0:
+            raise ValueError("stable_steps must be positive.")
+        self._minimum_completed_attempts = int(
+            cfg.params["minimum_completed_attempts"]
+        )
+        if self._minimum_completed_attempts <= 0:
+            raise ValueError("minimum_completed_attempts must be positive.")
 
         self._debug_vis_enabled = bool(cfg.params.get("debug_vis", True))
         self._viz_scale = float(cfg.params.get("viz_scale", 0.002))
@@ -303,19 +395,65 @@ class UpwardRecoveryAssistance:
             (self._num_envs, self._num_bodies, 3), device=self._device
         )
         self._torques = torch.zeros_like(self._forces)
+        self._attempt_active = torch.zeros(
+            self._num_envs, dtype=torch.bool, device=self._device
+        )
+        self._stable_counts = torch.zeros(
+            self._num_envs, dtype=torch.long, device=self._device
+        )
+        self._attempt_steps = torch.zeros_like(self._stable_counts)
+        self._pending_successes = torch.zeros(
+            (), dtype=torch.long, device=self._device
+        )
+        self._pending_failures = torch.zeros_like(self._pending_successes)
+        self._pending_timeouts = torch.zeros_like(self._pending_successes)
+        self._completed_successes = torch.zeros_like(self._pending_successes)
+        self._completed_failures = torch.zeros_like(self._pending_successes)
+        self._completed_timeouts = torch.zeros_like(self._pending_successes)
+        self._completed_success_steps = torch.zeros_like(self._pending_successes)
 
     def __call__(
         self,
         env: ManagerBasedRlEnv,
         env_ids: torch.Tensor | None,
         force_range: tuple[float, float],
-        anneal_steps: int,
+        assistance_scales: tuple[float, ...],
+        evaluation_interval_steps: int,
+        success_ema_alpha: float,
+        advance_threshold: float,
+        advance_hold_evaluations: int,
+        rollback_threshold: float,
+        rollback_hold_evaluations: int,
+        minimum_height: float,
+        maximum_tilt: float,
+        stable_steps: int,
+        minimum_completed_attempts: int,
         asset_cfg: SceneEntityCfg,
+        initial_stage: int = 0,
         debug_vis: bool = True,
         viz_scale: float = 0.002,
         viz_width: float = 0.02,
     ) -> None:
-        del env_ids, force_range, anneal_steps, asset_cfg, debug_vis, viz_scale, viz_width
+        del (
+            env_ids,
+            force_range,
+            assistance_scales,
+            evaluation_interval_steps,
+            success_ema_alpha,
+            advance_threshold,
+            advance_hold_evaluations,
+            rollback_threshold,
+            rollback_hold_evaluations,
+            minimum_height,
+            maximum_tilt,
+            stable_steps,
+            minimum_completed_attempts,
+            asset_cfg,
+            initial_stage,
+            debug_vis,
+            viz_scale,
+            viz_width,
+        )
 
         tm = env.termination_manager
         if isinstance(tm, DelayedTerminationManager):
@@ -325,8 +463,14 @@ class UpwardRecoveryAssistance:
                 self._num_envs, dtype=torch.bool, device=self._device
             )
 
-        progress = min(env.common_step_counter / self._anneal_steps, 1.0)
-        scale = max(1.0 - progress, 0.0)
+        standing_occupancy = self._update_attempts(env, tm)
+        if (
+            env.common_step_counter - self._last_evaluation_step
+            >= self._evaluation_interval_steps
+        ):
+            self._evaluate_curriculum(env.common_step_counter)
+
+        scale = self._curriculum.scale
         self._applied_magnitude.copy_(
             self._sampled_magnitude * scale * active.float()
         )
@@ -346,9 +490,155 @@ class UpwardRecoveryAssistance:
         log["Curriculum/upward_assistance_scale"] = torch.tensor(
             scale, device=self._device
         )
+        log["Curriculum/upward_assistance_stage"] = torch.tensor(
+            self._curriculum.stage, device=self._device
+        )
+        log["Metrics/recovery_standing_occupancy"] = standing_occupancy
+        log["Metrics/recovery_attempt_success_rate"] = torch.tensor(
+            self._last_attempt_success_rate or 0.0,
+            device=self._device,
+        )
+        log["Metrics/recovery_attempt_success_rate_ema"] = torch.tensor(
+            self._success_ema if self._success_ema is not None else 0.0,
+            device=self._device,
+        )
+        log["Metrics/recovery_attempt_failure_rate"] = torch.tensor(
+            self._last_attempt_failure_rate or 0.0,
+            device=self._device,
+        )
+        log["Metrics/recovery_attempt_timeout_rate"] = torch.tensor(
+            self._last_attempt_timeout_rate or 0.0,
+            device=self._device,
+        )
+        log["Metrics/recovery_attempts_pending"] = self._pending_attempts()
+        log["Metrics/recovery_attempts_completed"] = (
+            self._completed_successes
+            + self._completed_failures
+            + self._completed_timeouts
+        )
+        log["Metrics/recovery_mean_steps_to_success"] = (
+            self._mean_steps_to_success()
+        )
         log["Metrics/upward_assistance_active_fraction"] = active.float().mean()
         log["Metrics/upward_assistance_force_mean"] = (
             self._applied_magnitude.mean()
+        )
+
+    def _standing_mask(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+        root_height = (
+            self._asset.data.body_link_pos_w[:, 0, 2]
+            - env.scene.env_origins[:, 2]
+        )
+        body_quat_w = self._asset.data.body_link_quat_w[:, self._body_ids[0]]
+        return standing_mask_from_state(
+            root_height,
+            body_quat_w,
+            self._asset.data.gravity_vec_w,
+            self._minimum_height,
+            self._maximum_tilt,
+        )
+
+    def _update_attempts(
+        self,
+        env: ManagerBasedRlEnv,
+        tm: DelayedTerminationManager | object,
+    ) -> torch.Tensor:
+        recovery_mask = getattr(tm, "_delay_env_mask", None)
+        if not isinstance(recovery_mask, torch.Tensor):
+            return torch.zeros((), device=self._device)
+
+        standing = self._standing_mask(env)
+        eligible = recovery_mask & self._attempt_active
+        self._attempt_steps[eligible] += 1
+        self._stable_counts[eligible & standing] += 1
+        self._stable_counts[eligible & ~standing] = 0
+
+        succeeded = eligible & (
+            self._stable_counts >= self._stable_steps_required
+        )
+        successes = torch.sum(succeeded)
+        success_steps = torch.sum(self._attempt_steps[succeeded])
+        self._pending_successes.add_(successes)
+        self._completed_successes.add_(successes)
+        self._completed_success_steps.add_(success_steps)
+        self._attempt_active[succeeded] = False
+        self._stable_counts[succeeded] = 0
+
+        mask = recovery_mask.float()
+        return torch.sum(standing.float() * mask) / torch.clamp(
+            torch.sum(mask), min=1.0
+        )
+
+    def _record_reset_outcomes(
+        self,
+        env_ids: torch.Tensor | slice,
+    ) -> None:
+        tm = self._env.termination_manager
+        recovery_mask = getattr(tm, "_delay_env_mask", None)
+        if not isinstance(recovery_mask, torch.Tensor):
+            self._attempt_active[env_ids] = False
+            self._stable_counts[env_ids] = 0
+            self._attempt_steps[env_ids] = 0
+            return
+
+        old_active = self._attempt_active[env_ids]
+        failure_buf = getattr(tm, "_delay_failure_buf", None)
+        timeout_buf = getattr(tm, "_delay_timeout_buf", None)
+        if isinstance(failure_buf, torch.Tensor):
+            failures = torch.sum(old_active & failure_buf[env_ids])
+            self._pending_failures.add_(failures)
+            self._completed_failures.add_(failures)
+            failure_buf[env_ids] = False
+        if isinstance(timeout_buf, torch.Tensor):
+            timeouts = torch.sum(old_active & timeout_buf[env_ids])
+            self._pending_timeouts.add_(timeouts)
+            self._completed_timeouts.add_(timeouts)
+            timeout_buf[env_ids] = False
+
+        self._attempt_active[env_ids] = recovery_mask[env_ids]
+        self._stable_counts[env_ids] = 0
+        self._attempt_steps[env_ids] = 0
+
+    def _pending_attempts(self) -> torch.Tensor:
+        return (
+            self._pending_successes
+            + self._pending_failures
+            + self._pending_timeouts
+        )
+
+    def _evaluate_curriculum(self, step: int) -> bool:
+        self._last_evaluation_step = step
+        completed = int(self._pending_attempts().item())
+        if completed < self._minimum_completed_attempts:
+            return False
+
+        successes = int(self._pending_successes.item())
+        failures = int(self._pending_failures.item())
+        timeouts = int(self._pending_timeouts.item())
+        success_rate = successes / completed
+        self._last_attempt_success_rate = success_rate
+        self._last_attempt_failure_rate = failures / completed
+        self._last_attempt_timeout_rate = timeouts / completed
+
+        if self._success_ema is None:
+            self._success_ema = success_rate
+        else:
+            alpha = self._success_ema_alpha
+            self._success_ema = (
+                alpha * success_rate + (1.0 - alpha) * self._success_ema
+            )
+        transitioned = self._curriculum.update(self._success_ema)
+        if transitioned:
+            self._success_ema = None
+
+        self._pending_successes.zero_()
+        self._pending_failures.zero_()
+        self._pending_timeouts.zero_()
+        return True
+
+    def _mean_steps_to_success(self) -> torch.Tensor:
+        return self._completed_success_steps.float() / torch.clamp(
+            self._completed_successes.float(), min=1.0
         )
 
     def debug_vis(self, visualizer: DebugVisualizer) -> None:
@@ -383,11 +673,79 @@ class UpwardRecoveryAssistance:
                     width=self._viz_width,
                 )
 
+    def state_dict(self) -> dict[str, float | int | None]:
+        """Return global curriculum state for checkpoint persistence."""
+        return {
+            "version": 2,
+            "stage": self._curriculum.stage,
+            "advance_count": self._curriculum.advance_count,
+            "rollback_count": self._curriculum.rollback_count,
+            "success_ema": self._success_ema,
+            "last_evaluation_step": self._last_evaluation_step,
+            "last_attempt_success_rate": self._last_attempt_success_rate,
+            "last_attempt_failure_rate": self._last_attempt_failure_rate,
+            "last_attempt_timeout_rate": self._last_attempt_timeout_rate,
+            "pending_successes": int(self._pending_successes.item()),
+            "pending_failures": int(self._pending_failures.item()),
+            "pending_timeouts": int(self._pending_timeouts.item()),
+            "completed_successes": int(self._completed_successes.item()),
+            "completed_failures": int(self._completed_failures.item()),
+            "completed_timeouts": int(self._completed_timeouts.item()),
+            "completed_success_steps": int(
+                self._completed_success_steps.item()
+            ),
+        }
+
+    def load_state_dict(self, state: dict[str, float | int | None]) -> None:
+        """Restore global curriculum state from a training checkpoint."""
+        version = int(state.get("version", 1))
+        stage = int(state.get("stage", self._curriculum.stage))
+        if not 0 <= stage < len(self._curriculum.scales):
+            raise ValueError(f"checkpoint assistance stage is invalid: {stage}")
+        self._curriculum.stage = stage
+        if version >= 2:
+            self._curriculum.advance_count = int(state.get("advance_count", 0))
+            self._curriculum.rollback_count = int(state.get("rollback_count", 0))
+            success_ema = state.get("success_ema")
+            self._success_ema = (
+                None if success_ema is None else float(success_ema)
+            )
+            self._last_evaluation_step = int(
+                state.get("last_evaluation_step", self._last_evaluation_step)
+            )
+        else:
+            # Version 1 used duration-biased standing occupancy as evidence.
+            self._curriculum.advance_count = 0
+            self._curriculum.rollback_count = 0
+            self._success_ema = None
+            self._last_evaluation_step = int(
+                getattr(self._env, "common_step_counter", 0)
+            )
+        for attr, key in (
+            ("_last_attempt_success_rate", "last_attempt_success_rate"),
+            ("_last_attempt_failure_rate", "last_attempt_failure_rate"),
+            ("_last_attempt_timeout_rate", "last_attempt_timeout_rate"),
+        ):
+            value = state.get(key)
+            setattr(self, attr, None if value is None else float(value))
+        for attr, key in (
+            ("_pending_successes", "pending_successes"),
+            ("_pending_failures", "pending_failures"),
+            ("_pending_timeouts", "pending_timeouts"),
+            ("_completed_successes", "completed_successes"),
+            ("_completed_failures", "completed_failures"),
+            ("_completed_timeouts", "completed_timeouts"),
+            ("_completed_success_steps", "completed_success_steps"),
+        ):
+            tensor = getattr(self, attr)
+            tensor.fill_(int(state.get(key, 0) or 0))
+
     def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
         if env_ids is None:
             env_ids = slice(None)
 
-        num_reset = self._num_envs if isinstance(env_ids, slice) else len(env_ids)
+        self._record_reset_outcomes(env_ids)
+        num_reset = self._sampled_magnitude[env_ids].numel()
         force_min, force_max = self._force_range
         sampled = torch.empty(num_reset, device=self._device).uniform_(
             force_min, force_max

@@ -214,7 +214,7 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = g1_amp_flat_env_cfg(play=play)
 
   # Mix recovery resets with quiet standing resets using a fixed startup mask.
-  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0 if play else 0.9
+  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0 if play else 0.4
   cfg.events["init_motion_loader"].params["max_delay_steps"] = 250
   cfg.events["reset_from_motion"].params["home_keyframe"] = HOME_KEYFRAME
 
@@ -231,6 +231,8 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
   # Velocity and terrain curricula are not part of recovery-only training.
   cfg.curriculum = {}
+
+  cfg.terminations["bad_base_height"].params["minimum_height"] = amp_mdp.RECOVERY_MINIMUM_HEIGHT
 
   cfg.rewards["track_root_height"].params.update(
     {
@@ -255,7 +257,7 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     weight=-1.0,
     params={
       "mask_delay": True,
-      "delay_env_rew_ratio": 0.0,
+      "delay_env_rew_ratio": 0.1,
       "asset_cfg": SceneEntityCfg("robot"),
       "body_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
     },
@@ -273,11 +275,36 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.metrics["standing_success"] = MetricsTermCfg(
     func=amp_mdp.standing_success,
     params={
-      "minimum_height": 0.7,
-      "maximum_tilt": math.radians(20.0),
+      "minimum_height": amp_mdp.RECOVERY_MINIMUM_HEIGHT,
+      "maximum_tilt": amp_mdp.RECOVERY_MAXIMUM_TILT,
       "asset_cfg": SceneEntityCfg("robot"),
       "body_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
     },
+  )
+  cfg.metrics["recovery_standing_occupancy"] = MetricsTermCfg(
+    func=amp_mdp.recovery_standing_success,
+    params={
+      "minimum_height": amp_mdp.RECOVERY_MINIMUM_HEIGHT,
+      "maximum_tilt": amp_mdp.RECOVERY_MAXIMUM_TILT,
+      "asset_cfg": SceneEntityCfg("robot"),
+      "body_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+    },
+  )
+  cfg.metrics["recovery_root_height"] = MetricsTermCfg(
+    func=amp_mdp.recovery_root_height,
+    params={"asset_cfg": SceneEntityCfg("robot")},
+  )
+  cfg.metrics["recovery_torso_tilt"] = MetricsTermCfg(
+    func=amp_mdp.recovery_body_tilt,
+    params={
+      "body_cfg": SceneEntityCfg("robot", body_names=("torso_link",)),
+    },
+  )
+  cfg.metrics["recovery_delayed_failure_occupancy"] = MetricsTermCfg(
+    func=amp_mdp.recovery_failure_rate,
+  )
+  cfg.metrics["recovery_timeout_incidence"] = MetricsTermCfg(
+    func=amp_mdp.recovery_timeout_rate,
   )
 
   if not play:
@@ -286,8 +313,21 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       mode="step",
       params={
         "force_range": (0.0, 200.0),
-        # 2000 policy iterations at 24 environment steps per iteration.
-        "anneal_steps": 2000 * 24,
+        "assistance_scales": (1.0, 0.75, 0.5, 0.25, 0.0),
+        # Evaluate once per PPO iteration and advance only after 100
+        # consecutive competent evaluations.
+        "evaluation_interval_steps": 24,
+        "success_ema_alpha": 0.05,
+        "advance_threshold": 0.8,
+        "advance_hold_evaluations": 100,
+        # Restore the previous stage if recovery substantially regresses.
+        "rollback_threshold": 0.6,
+        "rollback_hold_evaluations": 50,
+        "initial_stage": 0,
+        "minimum_height": amp_mdp.RECOVERY_MINIMUM_HEIGHT,
+        "maximum_tilt": amp_mdp.RECOVERY_MAXIMUM_TILT,
+        "stable_steps": amp_mdp.RECOVERY_STABLE_STEPS,
+        "minimum_completed_attempts": 128,
         "asset_cfg": SceneEntityCfg(
           "robot", body_names=("torso_link",)
         ),

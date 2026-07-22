@@ -81,6 +81,23 @@ Main tasks:
 
 ```bash
 python scripts/train.py Unitree-G1-AMP-Flat --env.scene.num-envs=4096
+
+# Recovery training with outcome-gated assistance.
+python scripts/train.py Unitree-G1-AMP-Recovery-Flat \
+  --env.scene.num-envs=4096
+```
+
+Recovery assistance is reduced only after enough completed recovery attempts sustain
+the configured success threshold. Success requires 25 consecutive stable-standing
+steps and each attempt contributes one outcome. This curriculum currently supports
+single-GPU training. Training logs include attempt-level recovery metrics, the
+assistance stage, and the current assistance scale.
+
+Evaluate a checkpoint without assistance, reset randomization, or observation noise:
+
+```bash
+python scripts/evaluate_recovery.py \
+  --checkpoint-file logs/rsl_rl/g1_amp_recovery/<run>/model_<iter>.pt
 ```
 
 Logs are saved by default to:

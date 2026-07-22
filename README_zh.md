@@ -84,6 +84,21 @@ python scripts/list_envs.py --keyword AMP
 
 ```bash
 python scripts/train.py Unitree-G1-AMP-Flat --env.scene.num-envs=4096
+
+# 使用 outcome-gated assistance 训练恢复策略。
+python scripts/train.py Unitree-G1-AMP-Recovery-Flat \
+  --env.scene.num-envs=4096
+```
+
+恢复辅助力只会在足够多的完整恢复尝试持续达到成功率阈值后降低。成功要求连续
+25 步保持稳定站立，并且每次恢复尝试只计入一个结果。该课程目前仅支持单 GPU
+训练。日志会记录 attempt-level 恢复指标、辅助阶段以及当前辅助力比例。
+
+以下命令使用固定恢复初始状态，并关闭辅助力、reset 随机化和观测噪声进行评估：
+
+```bash
+python scripts/evaluate_recovery.py \
+  --checkpoint-file logs/rsl_rl/g1_amp_recovery/<run>/model_<iter>.pt
 ```
 
 

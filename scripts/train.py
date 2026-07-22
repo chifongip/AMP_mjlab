@@ -19,6 +19,11 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wrappers import VideoRecorder
 
+from src.tasks.amp_loco.recovery_curriculum import (
+  configure_recovery_curriculum_interval,
+  validate_recovery_curriculum_workers,
+)
+
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -58,6 +63,10 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   cfg.agent.seed = seed
   cfg.env.seed = seed
+  configure_recovery_curriculum_interval(
+    cfg.env.events,
+    cfg.agent.num_steps_per_env,
+  )
 
   print(f"[INFO] Training with: device={device}, seed={seed}, rank={rank}")
 
@@ -155,6 +164,7 @@ def launch_training(task_id: str, args: TrainConfig | None = None):
 
   # Select GPUs based on CUDA_VISIBLE_DEVICES and user specification.
   selected_gpus, num_gpus = select_gpus(args.gpu_ids)
+  validate_recovery_curriculum_workers(args.env.events, num_gpus)
 
   # Set environment variables for all modes.
   if selected_gpus is None:
