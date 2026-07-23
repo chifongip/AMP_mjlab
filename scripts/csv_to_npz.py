@@ -28,6 +28,11 @@
 #   --window-realtime True \
 #   --window-realtime-scale 1.0
 
+# G1 23-DOF:
+# python scripts/csv_to_npz.py --robot g1_23dof --input-file <motion.csv>
+#
+# X2 (accepts 29 body joints, with or without 2 trailing head joints):
+# python scripts/csv_to_npz.py --robot x2 --input-file <motion.csv>
 
 from pathlib import Path
 import time
@@ -42,7 +47,7 @@ from tqdm import tqdm
 
 import mjlab
 from mjlab.entity import Entity
-from mjlab.scene import Scene
+from mjlab.scene import Scene, SceneCfg
 from mjlab.sim.sim import Simulation, SimulationCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 from mjlab.utils.lab_api.math import (
@@ -54,14 +59,25 @@ from mjlab.utils.lab_api.math import (
 from mjlab.viewer.offscreen_renderer import OffscreenRenderer
 from mjlab.viewer.viewer_config import ViewerConfig
 
+from src.assets.robots import (
+  get_agibot_x2_robot_cfg,
+  get_g1_23dof_robot_cfg,
+)
+
+
+RobotName = Literal["g1", "g1_23dof", "x2"]
+X2_HEAD_JOINT_NAMES = ("head_yaw_joint", "head_pitch_joint")
+
 
 class MotionLoader:
   def __init__(
     self,
     motion_file: str,
-    input_fps: int,
-    output_fps: int,
+    input_fps: float,
+    output_fps: float,
     device: torch.device | str,
+    robot_name: RobotName,
+    joint_names: tuple[str, ...],
     line_range: tuple[int, int] | None = None,
   ):
     self.motion_file = motion_file
@@ -71,6 +87,8 @@ class MotionLoader:
     self.output_dt = 1.0 / self.output_fps
     self.current_idx = 0
     self.device = device
+    self.robot_name = robot_name
+    self.joint_names = joint_names
     self.line_range = line_range
     self._load_motion()
     self._interpolate_motion()
@@ -89,14 +107,49 @@ class MotionLoader:
           max_rows=self.line_range[1] - self.line_range[0] + 1,
         )
       )
+
+    if motion.ndim == 1:
+      motion = motion.unsqueeze(0)
+    if motion.ndim != 2:
+      raise ValueError(
+        f"{self.motion_file}: expected a 2D headerless CSV, got shape "
+        f"{tuple(motion.shape)}."
+      )
+
+    target_width = 7 + len(self.joint_names)
+    allowed_widths = (target_width,)
+    if self.robot_name == "x2":
+      allowed_widths = (target_width, target_width + len(X2_HEAD_JOINT_NAMES))
+    if motion.shape[1] not in allowed_widths:
+      expected = " or ".join(str(width) for width in allowed_widths)
+      raise ValueError(
+        f"{self.motion_file}: {self.robot_name} expects {expected} columns "
+        f"(7 root + {len(self.joint_names)} target joints"
+        f"{' + optional 2 head joints' if self.robot_name == 'x2' else ''}), "
+        f"got {motion.shape[1]}."
+      )
+
+    csv_joint_names = self.joint_names
+    if self.robot_name == "x2" and motion.shape[1] == target_width + 2:
+      csv_joint_names += X2_HEAD_JOINT_NAMES
+      print(
+        f"{self.motion_file}: dropping zero-based X2 CSV columns 36-37 "
+        "(head_yaw_joint, head_pitch_joint)."
+      )
+    joint_columns = [
+      7 + csv_joint_names.index(joint_name) for joint_name in self.joint_names
+    ]
+
     motion = motion.to(torch.float32).to(self.device)
+    if not torch.isfinite(motion).all():
+      raise ValueError(f"{self.motion_file}: CSV contains non-finite values.")
     # motion[:, 2] -= 0.05
     self.motion_base_poss_input = motion[:, :3]
     self.motion_base_rots_input = motion[:, 3:7]
     self.motion_base_rots_input = self.motion_base_rots_input[
       :, [3, 0, 1, 2]
     ]  # convert to wxyz
-    self.motion_dof_poss_input = motion[:, 7:]
+    self.motion_dof_poss_input = motion[:, joint_columns]
 
     self.input_frames = motion.shape[0]
     self.duration = (self.input_frames - 1) * self.input_dt
@@ -218,14 +271,15 @@ class MotionLoader:
 def run_sim(
   sim: Simulation,
   scene: Scene,
-  joint_names,
-  input_file,
-  input_fps,
-  output_fps,
-  output_name,
-  output_dir,
-  render,
-  line_range,
+  robot_name: RobotName,
+  joint_names: tuple[str, ...],
+  input_file: str,
+  input_fps: float,
+  output_fps: float,
+  output_name: str,
+  output_dir: str,
+  render: bool,
+  line_range: tuple[int, int] | None,
   renderer: OffscreenRenderer | None = None,
   window_viewer: Any | None = None,
   video_output: str | None = None,
@@ -237,6 +291,8 @@ def run_sim(
     input_fps=input_fps,
     output_fps=output_fps,
     device=sim.device,
+    robot_name=robot_name,
+    joint_names=joint_names,
     line_range=line_range,
   )
 
@@ -245,6 +301,7 @@ def run_sim(
 
   log: dict[str, Any] = {
     "fps": [output_fps],
+    "joint_names": np.asarray(robot.joint_names, dtype=str),
     "joint_pos": [],
     "joint_vel": [],
     "body_pos_w": [],
@@ -394,7 +451,19 @@ def run_sim(
           iio.imwrite(str(mp4_path), np.stack(frames, axis=0), fps=output_fps)
 
 
+def make_scene(robot_name: RobotName, device: str) -> Scene:
+  """Create the replay scene for the selected robot."""
+  if robot_name == "g1":
+    return Scene(unitree_g1_flat_tracking_env_cfg().scene, device=device)
+  if robot_name == "g1_23dof":
+    robot_cfg = get_g1_23dof_robot_cfg()
+  else:
+    robot_cfg, _ = get_agibot_x2_robot_cfg()
+  return Scene(SceneCfg(entities={"robot": robot_cfg}), device=device)
+
+
 def main(
+  robot: RobotName = "g1",
   input_file: str | None = None,
   output_name: str | None = None,
   input_dir: str | None = None,
@@ -413,6 +482,7 @@ def main(
   """Replay motion from CSV file and output to npz file.
 
   Args:
+    robot: Robot model matching the CSV joint data.
     input_file: Path to a single input CSV file.
     output_name: Output npz filename (used with input_file).
     input_dir: Directory containing CSV files for batch conversion.
@@ -445,12 +515,16 @@ def main(
   sim_cfg = SimulationCfg()
   sim_cfg.mujoco.timestep = 1.0 / output_fps
 
-  scene = Scene(unitree_g1_flat_tracking_env_cfg().scene, device=device)
+  scene = make_scene(robot, device)
   model = scene.compile()
 
   sim = Simulation(num_envs=1, cfg=sim_cfg, model=model, device=device)
 
   scene.initialize(sim.mj_model, sim.model, sim.data)
+  robot_entity: Entity = scene["robot"]
+  joint_names = tuple(robot_entity.joint_names)
+  print(f"Using {robot} joint order ({len(joint_names)} joints):")
+  print(", ".join(joint_names))
 
   renderer = None
   if render and render_backend == "offscreen":
@@ -477,38 +551,6 @@ def main(
     )
     renderer.initialize()
 
-  joint_names = [
-    "left_hip_pitch_joint",
-    "left_hip_roll_joint",
-    "left_hip_yaw_joint",
-    "left_knee_joint",
-    "left_ankle_pitch_joint",
-    "left_ankle_roll_joint",
-    "right_hip_pitch_joint",
-    "right_hip_roll_joint",
-    "right_hip_yaw_joint",
-    "right_knee_joint",
-    "right_ankle_pitch_joint",
-    "right_ankle_roll_joint",
-    "waist_yaw_joint",
-    "waist_roll_joint",
-    "waist_pitch_joint",
-    "left_shoulder_pitch_joint",
-    "left_shoulder_roll_joint",
-    "left_shoulder_yaw_joint",
-    "left_elbow_joint",
-    "left_wrist_roll_joint",
-    "left_wrist_pitch_joint",
-    "left_wrist_yaw_joint",
-    "right_shoulder_pitch_joint",
-    "right_shoulder_roll_joint",
-    "right_shoulder_yaw_joint",
-    "right_elbow_joint",
-    "right_wrist_roll_joint",
-    "right_wrist_pitch_joint",
-    "right_wrist_yaw_joint",
-  ]
-
   for i, (cur_input_file, cur_output_name) in enumerate(file_pairs):
     if len(file_pairs) > 1:
       print(f"\n{'='*60}")
@@ -518,6 +560,7 @@ def main(
     common_kwargs = dict(
       sim=sim,
       scene=scene,
+      robot_name=robot,
       joint_names=joint_names,
       input_fps=input_fps,
       input_file=cur_input_file,
