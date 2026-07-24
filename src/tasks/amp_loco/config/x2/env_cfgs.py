@@ -78,5 +78,6 @@ def x2_amp_recovery_flat_env_cfg(
   assistance = cfg.events.get("upward_recovery_assistance")
   if assistance is not None:
     assistance.params["minimum_height"] = _RECOVERY_MINIMUM_HEIGHT
+    assistance.params["force_range"] = (0.0, 240.0)
 
   return cfg

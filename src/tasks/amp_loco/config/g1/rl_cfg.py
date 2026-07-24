@@ -102,4 +102,5 @@ def g1_amp_recovery_ppo_runner_cfg() -> RslRlAmpRunnerCfg:
   cfg.amp_motion_files = os.path.normpath(
     os.path.join(_MOTION_DATA_DIR, "Recovery")
   )
+  cfg.max_iterations = 20001
   return cfg

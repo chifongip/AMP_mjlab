@@ -214,8 +214,8 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg = g1_amp_flat_env_cfg(play=play)
 
   # Mix recovery resets with quiet standing resets using a fixed startup mask.
-  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0 if play else 0.4
-  cfg.events["init_motion_loader"].params["max_delay_steps"] = 250
+  cfg.events["init_motion_loader"].params["delay_reset_env_ratio"] = 1.0 if play else 0.9
+  cfg.events["init_motion_loader"].params["max_delay_steps"] = 400
   cfg.events["reset_from_motion"].params["home_keyframe"] = HOME_KEYFRAME
 
   # Recovery ends in quiet standing rather than commanded locomotion.
@@ -238,6 +238,7 @@ def g1_amp_recovery_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     {
       "target_height": HOME_KEYFRAME.pos[2],
       "reward_outside_delay": True,
+      "delay_env_rew_ratio": 0.1,
     }
   )
 
